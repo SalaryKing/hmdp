@@ -105,9 +105,9 @@ if (!success) {
 
 假设线程1过来查询库存，判断出来库存大于1，正准备去扣减库存，但是还没有来得及去扣减，此时线程2过来，线程2也去查询库存，发现这个数量一定也大于1，那么这两个线程都会去扣减库存，最终多个线程都会去扣减库存，此时就会出现库存的超卖问题。
 
-![image-20250720213107857](C:/Users/ASUS/AppData/Roaming/Typora/typora-user-images/image-20250720213107857.png)
+![image-20250720213107857](assets/image-20250720213107857.png)
 
 超卖问题是典型的多线程安全问题，针对这一问题的常见解决方案就是加锁：而对于加锁，我们通常有两种解决方案
 
-![image-20250720213410286](C:/Users/ASUS/AppData/Roaming/Typora/typora-user-images/image-20250720213410286.png)
+![image-20250720213410286](assets/image-20250720213410286.png)
 
