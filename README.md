@@ -111,3 +111,27 @@ if (!success) {
 
 ![image-20250720213410286](assets/image-20250720213410286.png)
 
+使用乐观锁解决超卖问题，乐观锁常用的两种实现：1-数据版本（Version）记录比较，2-时间戳记录比较。
+
+**修改代码方案一：**
+
+VoucherOrderServiceImpl在扣减库存时，改为：
+
+```java
+boolean success = seckillVoucherService.update()
+            .setSql("stock= stock -1") //set stock = stock -1
+            .eq("voucher_id", voucherId).eq("stock",voucher.getStock()).update(); //where id = ？ and stock = ?
+```
+
+以上逻辑的核心含义是：只要我扣减库存时的库存和之前我查询到的库存是一样的，就意味着没有人在中间修改过库存，那么此时就是安全的。但是以上这种方式通过测试发现会有很多失败的情况，失败的原因在于：在使用乐观锁过程中假设100个线程同时都拿到了100的库存，然后大家一起去进行扣减，但是100个人中只有1个人能扣减成功，其他的人在处理时，他们在扣减时，库存已经被修改过了，所以此时其他线程都会失效。
+
+**修改代码方案二：**
+
+之前的方式要修改前后都保持一致，但是这样我们分析过，成功的概率太低，所以我们的乐观锁需要变一下，改成stock大于0 即可。
+
+```java
+boolean success = seckillVoucherService.update()
+            .setSql("stock= stock -1")
+            .eq("voucher_id", voucherId).update().gt("stock",0); //where id = ? and stock > 0
+```
+
