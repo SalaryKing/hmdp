@@ -135,3 +135,166 @@ boolean success = seckillVoucherService.update()
             .eq("voucher_id", voucherId).update().gt("stock",0); //where id = ? and stock > 0
 ```
 
+##### 一人一单
+
+**需求：**修改秒杀业务，要求同一个优惠券，一个用户只能下一单。
+
+**现在的问题：**优惠券是为了引流，但目前，一个人可以无限制抢这个优惠券，所以我们应当加一层逻辑，让一个用户对同一个优惠券只能下一个单。
+
+**改进后逻辑：**判断秒杀活动是否开始，如果开始，则再判断库存是否充足，然后再根据优惠券id和用户id查询是否已经下过这个订单，若下过这个订单，则不再下单，否则进行下单操作。
+
+![image-20250721214227823](assets/image-20250721214227823.png)
+
+**初步代码：增加一人一单逻辑**
+
+```java
+@Override
+public Result seckillVoucher(Long voucherId) {
+    // 1.查询优惠券
+    SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+    // 2.判断秒杀是否开始
+    if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+        // 尚未开始
+        return Result.fail("秒杀尚未开始！");
+    }
+    // 3.判断秒杀是否已经结束
+    if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+        // 尚未开始
+        return Result.fail("秒杀已经结束！");
+    }
+    // 4.判断库存是否充足
+    if (voucher.getStock() < 1) {
+        // 库存不足
+        return Result.fail("库存不足！");
+    }
+    // 5.一人一单逻辑
+    // 5.1.用户id
+    Long userId = UserHolder.getUser().getId();
+    int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+    // 5.2.判断是否存在
+    if (count > 0) {
+        // 用户已经购买过了
+        return Result.fail("用户已经购买过一次！");
+    }
+
+    //6，扣减库存
+    boolean success = seckillVoucherService.update()
+            .setSql("stock= stock -1")
+            .eq("voucher_id", voucherId).update();
+    if (!success) {
+        //扣减库存
+        return Result.fail("库存不足！");
+    }
+    //7.创建订单
+    VoucherOrder voucherOrder = new VoucherOrder();
+    // 7.1.订单id
+    long orderId = redisIdWorker.nextId("order");
+    voucherOrder.setId(orderId);
+
+    voucherOrder.setUserId(userId);
+    // 7.3.代金券id
+    voucherOrder.setVoucherId(voucherId);
+    save(voucherOrder);
+
+    return Result.ok(orderId);
+}
+```
+
+**存在问题：**并发过来，查询数据库，都不存在订单，也会创建多个订单。所以我们还是需要加锁，但是乐观锁比较适合更新数据，现在是插入数据，所以我们需要使用悲观锁操作。
+
+**添加锁：**初始方案是封装了一个createVoucherOrder方法，同时为了确保线程安全，在方法上添加一把synchronized锁。
+
+```java
+@Transactional
+public synchronized Result createVoucherOrder(Long voucherId) {
+	Long userId = UserHolder.getUser().getId();
+         // 5.1.查询订单
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        // 5.2.判断是否存在
+        if (count > 0) {
+            // 用户已经购买过了
+            return Result.fail("用户已经购买过一次！");
+        }
+
+        // 6.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1") // set stock = stock - 1
+                .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
+                .update();
+        if (!success) {
+            // 扣减失败
+            return Result.fail("库存不足！");
+        }
+
+        // 7.创建订单
+        VoucherOrder voucherOrder = new VoucherOrder();
+        // 7.1.订单id
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        // 7.2.用户id
+        voucherOrder.setUserId(userId);
+        // 7.3.代金券id
+        voucherOrder.setVoucherId(voucherId);
+        save(voucherOrder);
+
+        // 7.返回订单id
+        return Result.ok(orderId);
+}
+```
+
+**问题：**这样添加锁，锁的粒度太粗，使用锁的过程中，控制锁粒度是非常重要的。如果锁的粒度太大，会导致每个线程进来都会锁住，锁 粒度太小，可能锁不住。
+
+**改进：**intern()这个方法是从常量池中拿到数据，如果我们直接使用userId.toString()他拿到的对象实际上是不同的对象，是new出来的对象。使用锁必须保证锁是同一把，所以我们需要使用intern()方法。
+
+```java
+@Transactional
+public  Result createVoucherOrder(Long voucherId) {
+	Long userId = UserHolder.getUser().getId();
+	synchronized(userId.toString().intern()){
+         // 5.1.查询订单
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        // 5.2.判断是否存在
+        if (count > 0) {
+            // 用户已经购买过了
+            return Result.fail("用户已经购买过一次！");
+        }
+
+        // 6.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1") // set stock = stock - 1
+                .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
+                .update();
+        if (!success) {
+            // 扣减失败
+            return Result.fail("库存不足！");
+        }
+
+        // 7.创建订单
+        VoucherOrder voucherOrder = new VoucherOrder();
+        // 7.1.订单id
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        // 7.2.用户id
+        voucherOrder.setUserId(userId);
+        // 7.3.代金券id
+        voucherOrder.setVoucherId(voucherId);
+        save(voucherOrder);
+
+        // 7.返回订单id
+        return Result.ok(orderId);
+    }
+}
+```
+
+但是以上代码还是存在问题，问题的原因在于当前方法被spring的事务控制，如果你在方法内部加锁，可能会导致当前方法事务还没有提交，但是锁已经释放也会导致问题，所以我们选择将当前方法整体包裹起来，确保事务不会出现问题，如下：
+
+在seckillVoucher 方法中，添加以下逻辑，这样就能保证事务的特性，同时也控制了锁的粒度。
+
+<img src="assets/image-20250721221427579.png" alt="image-20250721221427579" style="zoom: 50%;" align="left">
+
+但是以上做法依然有问题，因为你调用的方法，其实是this.的方式调用的，事务想要生效，还得利用代理来生效，所以这个地方，我们需要获得原始的事务对象，来操作事务。
+
+![image-20250721222347831](assets/image-20250721222347831.png)
+
+
+
