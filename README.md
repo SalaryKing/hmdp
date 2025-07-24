@@ -296,5 +296,213 @@ public  Result createVoucherOrder(Long voucherId) {
 
 ![image-20250721222347831](assets/image-20250721222347831.png)
 
+##### 问题：集群下的并发
 
+通过加锁可以解决在单机情况下的一人一单安全问题，但是在集群模式下就不行了。
+
+1、我们将服务启动两份，端口分别为8081和8082：
+
+<img src="assets/image-20250724232311622.png" alt="image-20250724232311622" style="zoom:60%;" align="left">
+
+2、然后修改nginx的conf目录下的nginx.conf文件，配置反向代理和负载均衡：
+
+<img src="assets/image-20250724232512042.png" alt="image-20250724232512042" style="zoom:60%;" align="left">
+
+**有关锁失效原因分析**
+
+现在我们部署了多个tomcat，每个tomcat都有一个属于自己的jvm。那么假设在服务器A的tomcat内部，有两个线程，这两个线程由于使用的是同一份代码，那么他们的锁对象是同一个，是可以实现互斥的。但是现在服务器B的tomcat内部，又有两个线程，但是他们的锁对象写的虽然和服务器A一样，但是锁对象却不是同一个，所以线程3和线程4可以实现互斥，但是却无法和线程1和线程2实现互斥。这就是集群环境下，syn锁失效的原因，在这种情况下，我们就需要使用分布式锁来解决这个问题。
+
+<img src="assets/image-20250724233059939.png" alt="image-20250724233059939" style="zoom: 50%;" align="left">
+
+##### 方案：使用分布式锁
+
+分布式锁：满足分布式系统或集群模式下多进程可见并且互斥的锁。
+
+简易实现：基于Redis的setnx命令实现获取锁，del命令及expire命令实现锁释放。
+
+一、初始版本分布式锁实现：
+
+利用setnx方法进行加锁，同时增加过期时间，防止死锁，此方法可以保证加锁和增加过期时间具有原子性
+
+```java
+private static final String KEY_PREFIX="lock:"
+@Override
+public boolean tryLock(long timeoutSec) {
+    // 获取线程标示
+    String threadId = Thread.currentThread().getId()
+    // 获取锁
+    Boolean success = stringRedisTemplate.opsForValue()
+            .setIfAbsent(KEY_PREFIX + name, threadId + "", timeoutSec, TimeUnit.SECONDS);
+    return Boolean.TRUE.equals(success);
+}
+```
+
+释放锁，防止删除别人的锁
+
+```java
+public void unlock() {
+    //通过del删除锁
+    stringRedisTemplate.delete(KEY_PREFIX + name);
+}
+```
+
+修改业务代码
+
+```java
+@Override
+public Result seckillVoucher(Long voucherId) {
+    // 1.查询优惠券
+    SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+    // 2.判断秒杀是否开始
+    if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+        // 尚未开始
+        return Result.fail("秒杀尚未开始！");
+    }
+    // 3.判断秒杀是否已经结束
+    if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+        // 尚未开始
+        return Result.fail("秒杀已经结束！");
+    }
+    // 4.判断库存是否充足
+    if (voucher.getStock() < 1) {
+        // 库存不足
+        return Result.fail("库存不足！");
+    }
+    Long userId = UserHolder.getUser().getId();
+    //创建锁对象(新增代码)
+    SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+    //获取锁对象
+    boolean isLock = lock.tryLock(1200);
+    //加锁失败
+    if (!isLock) {
+        return Result.fail("不允许重复下单");
+    }
+    try {
+        //获取代理对象(事务)
+        IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+        return proxy.createVoucherOrder(voucherId);
+    } finally {
+        //释放锁
+        lock.unlock();
+    }
+}
+```
+
+问题：多线程时，其他线程删除了本线程持有的锁。
+
+二、解决分布式锁误删问题：
+
+核心逻辑：在存入锁时，放入自己线程的标识。在删除锁时，判断当前这把锁的标识是不是自己存入的，如果是，则进行删除，如果不是，则不进行删除。
+
+加锁
+
+```java
+private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
+@Override
+public boolean tryLock(long timeoutSec) {
+   // 获取线程标示
+   String threadId = ID_PREFIX + Thread.currentThread().getId();
+   // 获取锁
+   Boolean success = stringRedisTemplate.opsForValue()
+                .setIfAbsent(KEY_PREFIX + name, threadId, timeoutSec, TimeUnit.SECONDS);
+   return Boolean.TRUE.equals(success);
+}
+```
+
+释放锁
+
+```java
+public void unlock() {
+    // 获取线程标示
+    String threadId = ID_PREFIX + Thread.currentThread().getId();
+    // 获取锁中的标示
+    String id = stringRedisTemplate.opsForValue().get(KEY_PREFIX + name);
+    // 判断标示是否一致
+    if(threadId.equals(id)) {
+        // 释放锁
+        stringRedisTemplate.delete(KEY_PREFIX + name);
+    }
+}
+```
+
+问题：判断标识与锁释放操作是两步，非原子操作，高并发下可能会出现问题。
+
+三、LUA脚本解决多条命令的原子性问题：
+
+Redis提供的调用函数，语法如下：
+
+```lua
+redis.call('命令名称','key','其他参数',...)
+```
+
+例如，我们要执行set name jack，则脚本是这样：
+
+```lua
+-- 执行 set name jack
+redis.call('set','name','jack')
+```
+
+例如，我们要先执行set name Rose，再执行get name，则脚本如下：
+
+```lua
+-- 先执行 set name jack
+redis.call('set','name','Rose')
+-- 再执行 get name
+local name = redis.call('get','name')
+-- 返回
+return name
+```
+
+写好脚本以后，需要用Redis命令来调用脚本，调用脚本的常见命令如下：
+
+<img src="assets/image-20250724235622265.png" alt="image-20250724235622265" style="zoom:50%;" align="left">
+
+例如，我们要执行 redis.call('set', 'name', 'jack') 这个脚本，语法如下：
+
+<img src="assets/image-20250724235705201.png" alt="image-20250724235705201" style="zoom: 67%;" align="left">
+
+如果脚本中的key、value不想写死，可以作为参数传递。key类型参数会放入KEYS数组，其它参数会放入ARGV数组，在脚本中可以从KEYS和ARGV数组获取这些参数：
+
+<img src="assets/image-20250724235831117.png" alt="image-20250724235831117" style="zoom: 67%;" align="left">
+
+最终我们操作redis的拿锁、比锁、删锁的lua脚本就会变成这样：
+
+```lua
+-- 这里的 KEYS[1] 就是锁的key，这里的ARGV[1] 就是当前线程标示
+-- 获取锁中的标示，判断是否与当前线程标示一致
+if (redis.call('GET', KEYS[1]) == ARGV[1]) then
+  -- 一致，则删除锁
+  return redis.call('DEL', KEYS[1])
+end
+-- 不一致，则直接返回
+return 0
+```
+
+四、分布式锁改造
+
+lua脚本本身并不需要大家花费太多时间去研究，只需要知道如何调用，大致是什么意思即可，所以在笔记中并不会详细的去解释这些lua表达式的含义。
+
+我们的RedisTemplate中，可以利用execute方法去执行lua脚本，参数对应关系就如下图
+
+<img src="assets/image-20250725000715758.png" alt="image-20250725000715758" style="zoom: 50%;" align="left">
+
+Java代码，锁释放逻辑
+
+```java
+private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
+    static {
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
+        UNLOCK_SCRIPT.setResultType(Long.class);
+    }
+
+public void unlock() {
+    // 调用lua脚本
+    stringRedisTemplate.execute(
+            UNLOCK_SCRIPT,
+            Collections.singletonList(KEY_PREFIX + name),
+            ID_PREFIX + Thread.currentThread().getId());
+}
+// 经过以上代码改造后，我们就能够实现 拿锁比锁删锁的原子性动作了~
+```
 
