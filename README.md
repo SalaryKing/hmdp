@@ -506,3 +506,212 @@ public void unlock() {
 // 经过以上代码改造后，我们就能够实现 拿锁比锁删锁的原子性动作了~
 ```
 
+##### 最终方案：Redisson
+
+Redisson是一个在Redis的基础上实现的Java驻内存数据网格（In-Memory Data Grid）。它不仅提供了一系列的分布式的Java常用对象，还提供了许多分布式服务。其中就包含了各种分布式锁的实现。
+
+一、基于SETNX实现的分布式锁存在以下问题：
+
+**重入问题：**重入问题是指获得锁的线程可以再次进入到相同的锁的代码块中，可重入锁的意义在于 防止死锁，比如HashTable这样的代码中，它的方法都是使用synchronized修饰的，假如它在一个方法内，调用另一个方法，那么此时如果是不可重入的，不就死锁了吗？所以可重入锁的主要意义是防止死锁，我们的synchronized和lock锁都是可重入的。
+
+**不可重试：**是指目前的获取分布式锁只能尝试一次，我们认为合理的情况是：当线程在获得锁失败后，它应当能再次尝试获得锁。
+
+**超时释放：**我们在加锁时增加了过期时间，这样我们可以防止死锁，但是如果卡顿的时间超长，虽然我们采用了lua脚本防止删锁的时候，误删别的线程的锁，但是毕竟没有锁住，有安全隐患。
+
+**主从一致性：**如果Redis提供了主从集群，当我们向集群写数据时，主机异步的将数据同步给从机，如果在同步过去之前，主机宕机了，就会出现死锁问题。
+
+二、分布式锁最终解决方案：使用Redisson锁：
+
+引入依赖：
+
+```xml
+<!--redisson-->
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.13.6</version>
+</dependency>
+```
+
+配置Redisson客户端：
+
+```java
+@Configuration
+public class RedissonConfig {
+
+    @Bean
+    public RedissonClient redissonClient() {
+        // 配置
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://192.168.88.114:6379").setPassword("123456");
+        // 创建RedissonClient对象
+        return Redisson.create(config);
+    }
+
+}
+```
+
+如何使用Redisson的分布式锁：
+
+```java
+@Resource
+private RedissionClient redissonClient;
+
+@Test
+void testRedisson() throws Exception{
+    //获取锁(可重入)，指定锁的名称
+    RLock lock = redissonClient.getLock("anyLock");
+    //尝试获取锁，参数分别是：获取锁的最大等待时间(期间会重试)，锁自动释放时间，时间单位
+    boolean isLock = lock.tryLock(1,10,TimeUnit.SECONDS);
+    //判断获取锁成功
+    if(isLock){
+        try{
+            System.out.println("执行业务");          
+        }finally{
+            //释放锁
+            lock.unlock();
+        }
+        
+    }    
+}
+```
+
+在VoucherOrderServiceImpl注入RedissonClient：
+
+```java
+@Resource
+RedissonClient redissonClient;
+
+@Override
+public Result seckillVoucher(Long voucherId) {
+    // 1、查询优惠券
+    SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+    // 2、判断秒杀是否开始
+    if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+        // 尚未开始
+        return Result.fail("秒杀尚未开始！");
+    }
+    // 3、判断秒杀是否已经结束
+    if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+        // 秒杀已经结束
+        return Result.fail("秒杀已经结束！");
+    }
+    // 4、判断库存是否充足
+    if (voucher.getStock() < 1) {
+        // 库存不足
+        return Result.fail("库存不足！");
+    }
+    Long userId = UserHolder.getUser().getId();
+    // 创建锁对象
+    // SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+    RLock lock = redissonClient.getLock("lock:order:" + userId);
+    // 获取锁
+    boolean isLock = lock.tryLock();
+    // 判断是否获取锁成功
+    if (!isLock) {
+        // 获取锁失败，返回错误或者重试
+        return Result.fail("不允许重复下单！");
+    }
+    try {
+        // 获取代理对象（事务）
+        IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+        return proxy.createVoucherOrder(voucherId);
+    } finally {
+        // 释放锁
+        lock.unlock();
+    }
+}
+```
+
+##### 秒杀优化：异步下单
+
+一、我们来回顾一下下单流程：
+
+当用户发起请求，此时会请求nginx，nginx会访问到tomcat，而tomcat中的程序，会进行串行操作，分成如下几个步骤：
+
+1、查询优惠券
+
+2、判断秒杀库存是否足够
+
+3、查询订单
+
+4、校验是否是一人一单
+
+5、扣减库存
+
+6、创建订单
+
+问题：在这六步操作中，又有很多操作是要去操作数据库的，而且还是在一个线程内串行执行，这样就会导致我们的程序执行的很慢。
+
+方案：关键数据保存至redis，lua脚本判断秒杀是否成功，开启异步线程完成秒杀成功用户的下单功能。
+
+- 新增秒杀优惠券的同时，将优惠券信息保存到Redis中
+- 基于Lua脚本，判断秒杀库存、一人一单、决定用户是否抢购成功
+- 如果抢购成功，将优惠券id和用户id封装后存入阻塞队列
+- 开启线程任务，不断从阻塞队列中获取信息，实现异步下单功能
+
+二、最终实现
+
+lua脚本，仅操作redis数据。
+
+秒杀成功判断（库存，一人一单），扣减库存（库存量-1）、保存已下单用户（避免一人多单）、发消息至队列（异步任务读取消息去真正创建订单）。
+
+```lua
+-- 1、参数列表
+-- 1.1、优惠券id
+local voucherId = ARGV[1]
+-- 1.2、用户id
+local userId = ARGV[2]
+
+-- 2、数据key
+-- 2.1、库存key
+local stockKey = "seckill:stock:" .. voucherId
+-- 2.2、订单key
+local orderKey = "seckill:order:" .. voucherId
+
+-- 3、脚本业务
+-- 3.1、判断库存是否充足 get stockKey
+if (tonumber(redis.call("get", stockKey)) <= 0) then
+    -- 库存不足，返回1
+    return 1
+end
+-- 3.2、判断用户是否下单 sismember orderKey userId
+if (redis.call("sismember", orderKey, userId) == 1) then
+    -- 存在，说明是重复下单，返回2
+    return 2
+end
+-- 3.3、扣库存 incrby stockKey -1
+redis.call("incrby", stockKey, -1)
+-- 3.4、下单（保存用户）sadd orderKey userId
+redis.call("sadd", orderKey, userId)
+-- 3.5、返回0，成功
+return 0
+```
+
+java代码，根据lua脚本的执行结果给用户响应（此时并没有真正的创建订单）。
+
+```java
+@Override
+public Result seckillVoucher(Long voucherId) {
+    //获取用户
+    Long userId = UserHolder.getUser().getId();
+    long orderId = redisIdWorker.nextId("order");
+    // 1.执行lua脚本
+    Long result = stringRedisTemplate.execute(
+            SECKILL_SCRIPT,
+            Collections.emptyList(),
+            voucherId.toString(), userId.toString(), String.valueOf(orderId)
+    );
+    int r = result.intValue();
+    // 2.判断结果是否为0
+    if (r != 0) {
+        // 2.1.不为0 ，代表没有购买资格
+        return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+    }
+    //TODO 保存阻塞队列
+    // 3.返回订单id
+    return Result.ok(orderId);
+}
+```
+
+java代码，异步任务创建订单。读取消息队列消息、解析数据、创建订单、确认消息。

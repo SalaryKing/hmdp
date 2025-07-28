@@ -29,7 +29,7 @@ public class SimpleRedisLock implements ILock {
     }
 
     @Override
-    public boolean truLock(long timeoutSec) {
+    public boolean tryLock(long timeoutSec) {
         // 获取线程标识
         String threadId = ID_PREFIX + Thread.currentThread().getId();
         // 获取锁
