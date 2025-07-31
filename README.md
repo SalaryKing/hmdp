@@ -895,3 +895,175 @@ private class VoucherOrderHandler implements Runnable {
 }
 ```
 
+#### 达人探店
+
+##### 发布探店笔记
+
+发布探店笔记
+
+探店笔记类似点评网站的评价，往往是图文结合。对应的表有两个：
+tb_blog：探店笔记表，包含笔记中的标题、文字、图片等
+tb_blog_comments：其他用户对探店笔记的评价
+
+**具体发布流程**
+
+<img src="assets/image-20250731230435745.png" alt="image-20250731230435745" style="zoom:50%;" align="left">
+
+上传接口
+
+```java
+@Slf4j
+@RestController
+@RequestMapping("upload")
+public class UploadController {
+
+    @PostMapping("blog")
+    public Result uploadImage(@RequestParam("file") MultipartFile image) {
+        try {
+            // 获取原始文件名称
+            String originalFilename = image.getOriginalFilename();
+            // 生成新文件名
+            String fileName = createNewFileName(originalFilename);
+            // 保存文件
+            image.transferTo(new File(SystemConstants.IMAGE_UPLOAD_DIR, fileName));
+            // 返回结果
+            log.debug("文件上传成功，{}", fileName);
+            return Result.ok(fileName);
+        } catch (IOException e) {
+            throw new RuntimeException("文件上传失败", e);
+        }
+    }
+
+}
+```
+
+注意：同学们在操作时，需要修改SystemConstants.IMAGE_UPLOAD_DIR 自己图片所在的地址，在实际开发中图片一般会放在nginx上或者是云存储上。
+
+BlogController
+
+```java
+@RestController
+@RequestMapping("/blog")
+public class BlogController {
+
+    @Resource
+    private IBlogService blogService;
+
+    @PostMapping
+    public Result saveBlog(@RequestBody Blog blog) {
+        // 获取登录用户
+        UserDTO user = UserHolder.getUser();
+        blog.setUserId(user.getId());
+        // 保存探店博文
+        blogService.save(blog);
+        // 返回id
+        return Result.ok(blog.getId());
+    }
+    
+}
+```
+
+##### 查看探店笔记
+
+实现查看发布探店笔记的接口
+
+<img src="assets/image-20250731231124610.png" alt="image-20250731231124610" style="zoom:50%;" align="left">
+
+实现代码：
+
+BlogServiceImpl
+
+```java
+@Override
+public Result queryBlogById(Long id) {
+    // 1.查询blog
+    Blog blog = getById(id);
+    if (blog == null) {
+        return Result.fail("笔记不存在！");
+    }
+    // 2.查询blog有关的用户
+    queryBlogUser(blog);
+  
+    return Result.ok(blog);
+}
+```
+
+##### 点赞探店笔记
+
+利用Redis的SET集合，判断某探店笔记当前登录用户是否点赞过
+
+初始代码
+
+```java
+@GetMapping("/likes/{id}")
+public Result queryBlogLikes(@PathVariable("id") Long id) {
+    //修改点赞数量
+    blogService.update().setSql("liked = liked +1 ").eq("id",id).update();
+    return Result.ok();
+}
+```
+
+问题分析：这种方式会导致一个用户无限点赞，明显是不合理的
+
+造成这个问题的原因是，我们现在的逻辑，发起请求只是给数据库+1，所以才会出现这个问题
+
+<img src="assets/image-20250731231551369.png" alt="image-20250731231551369" style="zoom:50%;" align="left">
+
+完善点赞功能
+
+需求：
+
+* 同一个用户只能点赞一次，再次点击则取消点赞
+* 如果当前用户已经点赞，则点赞按钮高亮显示（前端已实现，判断字段Blog类的isLike属性）
+
+实现步骤：
+
+* 给Blog类中添加一个isLike字段，标示是否被当前用户点赞
+* 修改点赞功能，利用Redis的set集合判断是否点赞过，未点赞过则点赞数+1，已点赞过则点赞数-1
+* 修改根据id查询Blog的业务，判断当前登录用户是否点赞过，赋值给isLike字段
+* 修改分页查询Blog业务，判断当前登录用户是否点赞过，赋值给isLike字段
+
+为什么采用set集合：
+
+因为我们的数据是不能重复的，当用户操作过之后，无论他怎么操作，都是
+
+具体步骤：
+
+1、在Blog 添加一个字段
+
+```java
+@TableField(exist = false)
+private Boolean isLike;
+```
+
+2、修改代码
+
+```java
+@Override
+public Result likeBlog(Long id) {
+    // 1、获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2、判断当前登录用户是否已经点赞
+    String key = "blog:liked:" + id;
+    Boolean isMember = stringRedisTemplate.opsForSet().isMember(key, userId.toString());
+    if (BooleanUtil.isFalse(isMember)) {
+        // 3、如果未点赞，则可以点赞
+        // 3.1、数据库点赞数+1
+        boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+        // 3.2、保存用户到Redis的Set集合
+        if (isSuccess) {
+            stringRedisTemplate.opsForSet().add(key, userId.toString());
+        }
+    } else {
+        // 4、如果已经点赞，则取消点赞
+        // 4.1、数据库点赞数-1
+        boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+        // 4.2、从Redis的Set集合移除用户
+        if (isSuccess) {
+            stringRedisTemplate.opsForSet().remove(key, userId.toString());
+        }
+    }
+    return Result.ok();
+}
+```
+
