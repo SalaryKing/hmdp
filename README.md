@@ -735,8 +735,10 @@ XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREA
 * STREAMS key：指定队列名称
 * ID：获取消息的起始ID：
 
-">"：从下一个未消费的消息开始
-其它：根据指定id从pending-list中获取已消费但未确认的消息，例如0，是从pending-list中的第一个消息开始
+	- ">"：从下一个未消费的消息开始
+
+
+	- 其它：根据指定id从pending-list中获取已消费但未确认的消息，例如0，是从pending-list中的第一个消息开始
 
 消费者监听消息的基本思路：
 
@@ -1067,3 +1069,105 @@ public Result likeBlog(Long id) {
 }
 ```
 
+##### 点赞排行榜
+
+利用Redis的SORTEDSET集合，可排序。
+
+在探店笔记的详情页面，应该把给该笔记点赞的人显示出来，比如最早点赞的TOP5，形成点赞排行榜：
+
+之前的点赞是放到set集合，但是set集合是不能排序的，所以这个时候，咱们可以采用一个可以排序的set集合，就是咱们的sortedSet
+
+<img src="assets/image-20250810171028964.png" alt="image-20250810171028964" style="zoom:40%;" align="left">
+
+我们接下来来对比一下这些集合的区别是什么
+
+所有点赞的人，需要是唯一的，所以我们应当使用set或者是sortedSet
+
+其次我们需要排序，就可以直接锁定使用sortedSet啦
+
+<img src="assets/image-20250810171146079.png" alt="image-20250810171146079" style="zoom:40%;" align="left">
+
+修改代码
+
+BlogServiceImpl
+
+点赞逻辑代码
+
+```java
+@Override
+public Result likeBlog(Long id) {
+    // 1.获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2.判断当前登录用户是否已经点赞
+    String key = BLOG_LIKED_KEY + id;
+    Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+    if (score == null) {
+        // 3.如果未点赞，可以点赞
+        // 3.1.数据库点赞数 + 1
+        boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+        // 3.2.保存用户到Redis的set集合  zadd key value score
+        if (isSuccess) {
+            stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+        }
+    } else {
+        // 4.如果已点赞，取消点赞
+        // 4.1.数据库点赞数 -1
+        boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+        // 4.2.把用户从Redis的set集合移除
+        if (isSuccess) {
+            stringRedisTemplate.opsForZSet().remove(key, userId.toString());
+        }
+    }
+    return Result.ok();
+}
+
+private void isBlogLiked(Blog blog) {
+    // 1.获取登录用户
+    UserDTO user = UserHolder.getUser();
+    if (user == null) {
+        // 用户未登录，无需查询是否点赞
+        return;
+    }
+    Long userId = user.getId();
+    // 2.判断当前登录用户是否已经点赞
+    String key = "blog:liked:" + blog.getId();
+    Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+    blog.setIsLike(score != null);
+}
+```
+
+点赞列表查询列表
+
+BlogController
+
+```java
+@GetMapping("/likes/{id}")
+public Result queryBlogLikes(@PathVariable("id") Long id) {
+    return blogService.queryBlogLikes(id);
+}
+```
+
+BlogService
+
+```java
+@Override
+public Result queryBlogLikes(Long id) {
+    String key = BLOG_LIKED_KEY + id;
+    // 1.查询top5的点赞用户 zrange key 0 4
+    Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+    if (top5 == null || top5.isEmpty()) {
+        return Result.ok(Collections.emptyList());
+    }
+    // 2.解析出其中的用户id
+    List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+    String idStr = StrUtil.join(",", ids);
+    // 3.根据用户id查询用户 WHERE id IN ( 5 , 1 ) ORDER BY FIELD(id, 5, 1)
+    List<UserDTO> userDTOS = userService.query()
+            .in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list()
+            .stream()
+            .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+            .collect(Collectors.toList());
+    // 4.返回
+    return Result.ok(userDTOS);
+}
+```
