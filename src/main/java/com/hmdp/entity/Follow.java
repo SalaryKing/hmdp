@@ -12,7 +12,7 @@ import java.time.LocalDateTime;
 
 /**
  * <p>
- * 
+ *
  * </p>
  *
  * @author 虎哥
@@ -46,6 +46,5 @@ public class Follow implements Serializable {
      * 创建时间
      */
     private LocalDateTime createTime;
-
 
 }
